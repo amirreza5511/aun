@@ -22,6 +22,11 @@
  *                agent tasks and self-improvement state here so they survive
  *                browser close AND server restart. Newer-wins: a push older
  *                than the stored copy is rejected with 409.
+ *   - /update    (v6) Remote self-update: an authorized client POSTs the new
+ *                companion source; it is syntax-checked with `node --check`,
+ *                the current file is backed up to .bak, the new source is
+ *                written over this file, and the process restarts into the
+ *                new version. No SSH needed for upgrades from v6 onward.
  *
  * Install (on your server):
  *   mkdir -p ~/aun && cd ~/aun
@@ -34,7 +39,7 @@
  */
 
 import { createServer } from "node:http";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, normalize } from "node:path";
 
@@ -367,7 +372,7 @@ const server = createServer(async (req, res) => {
     if (url.pathname === "/health") {
       const docker = await new Promise((r) => execFile("docker", ["--version"], (e) => r(!e)));
       const ytdlp = await new Promise((r) => execFile("yt-dlp", ["--version"], (e) => r(!e)));
-      return json(res, 200, { ok: true, version: 5, startedAt: SERVER_STARTED_AT, docker, ytdlp, agents: agents.length, jobs: Object.keys(jobs).length, stateProjects: Object.keys(projState).length });
+      return json(res, 200, { ok: true, version: 6, selfUpdate: true, startedAt: SERVER_STARTED_AT, docker, ytdlp, agents: agents.length, jobs: Object.keys(jobs).length, stateProjects: Object.keys(projState).length });
     }
 
     if (url.pathname === "/relay" && req.method === "POST") {
@@ -528,6 +533,32 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    // v6: remote self-update — the ONLY way to upgrade without SSH. The new
+    // source must look like a companion file and pass `node --check` before it
+    // replaces this file; the old file is kept as .bak. After a 200 reply the
+    // process restarts into the new version (spawned detached, or plain exit
+    // when AUN_SUPERVISED=1 so systemd does the restart).
+    if (url.pathname === "/update" && req.method === "POST") {
+      const { source } = JSON.parse((await readBody(req, 20_000_000)).toString());
+      const src = String(source ?? "");
+      if (src.length < 5_000 || !src.includes("AUN Deep Mind — server companion")) {
+        return json(res, 400, { error: "not a companion source file — refusing to overwrite myself" });
+      }
+      const selfPath = process.argv[1];
+      const tmpPath = join(DATA_DIR, "companion-update.tmp.mjs");
+      await writeFile(tmpPath, src);
+      const check = await new Promise((r) =>
+        execFile(process.execPath, ["--check", tmpPath], (e, _o, stderr) => r({ ok: !e, err: String(stderr).slice(0, 300) })),
+      );
+      if (!check.ok) return json(res, 400, { error: `syntax check failed — update refused: ${check.err}` });
+      const current = await readFile(selfPath, "utf8").catch(() => "");
+      if (current) await writeFile(`${selfPath}.bak`, current);
+      await writeFile(selfPath, src);
+      json(res, 200, { ok: true, restarting: true, backup: `${selfPath}.bak` });
+      setTimeout(() => restartIntoNewVersion(selfPath), 300);
+      return;
+    }
+
     if (url.pathname === "/agents" && req.method === "POST") {
       agents = JSON.parse((await readBody(req)).toString());
       await writeFile(AGENTS_FILE, JSON.stringify(agents));
@@ -542,5 +573,27 @@ const server = createServer(async (req, res) => {
     return json(res, 500, { error: String(err) });
   }
 });
+
+/**
+ * Restarts the process into the freshly written file. Runs exactly once even
+ * if both the close callback and the safety timeout fire. With AUN_SUPERVISED=1
+ * it simply exits 0 and lets systemd/pm2 restart; otherwise it spawns a
+ * detached replacement (covers the `nohup node aun-companion.mjs &` install).
+ */
+let restartTriggered = false;
+function restartIntoNewVersion(selfPath) {
+  const relaunch = () => {
+    if (restartTriggered) return;
+    restartTriggered = true;
+    if (process.env.AUN_SUPERVISED !== "1") {
+      const child = spawn(process.execPath, [selfPath], { detached: true, stdio: "ignore", env: process.env, cwd: process.cwd() });
+      child.unref();
+    }
+    process.exit(0);
+  };
+  server.closeAllConnections?.();
+  server.close(relaunch);
+  setTimeout(relaunch, 3000);
+}
 
 server.listen(PORT, () => console.log(`AUN companion listening on :${PORT} (data: ${DATA_DIR})`));
